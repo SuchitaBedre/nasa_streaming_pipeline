@@ -1,66 +1,69 @@
 version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.8.1}
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'False'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - ./data:/opt/airflow/data
+    - ./logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
   postgres:
-    image: postgres:14
+    image: postgres:13
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
 
-  redis:
-    image: redis:6
+  airflow-init:
+    <<: *airflow-common
+    command: version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_WWW_USER_PASSWORD:-airflow}
 
   airflow-webserver:
-    image: apache/airflow:2.8.0
-    depends_on:
-      - postgres
-      - redis
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
-      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
-      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - S3_BUCKET_NAME=file:///opt/airflow/data
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./src:/opt/airflow/src
-      - ./data:/opt/airflow/data
-    ports:
-      - 8080:8080
+    <<: *airflow-common
     command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: always
 
   airflow-scheduler:
-    image: apache/airflow:2.8.0
-    depends_on:
-      - airflow-webserver
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=CeleryExecutor
-      - AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres/airflow
-      - AIRFLOW__CELERY__BROKER_URL=redis://redis:6379/0
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - S3_BUCKET_NAME=file:///opt/airflow/data
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./src:/opt/airflow/src
-      - ./data:/opt/airflow/data
+    <<: *airflow-common
     command: scheduler
+    restart: always
 
-  spark-master:
-    image: bitnami/spark:3.4.1
-    environment:
-      - SPARK_MODE=master
-    ports:
-      - 7077:7077
-
-  spark-worker:
-    image: bitnami/spark:3.4.1
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
-
-# Notes:
-# - This compose is an illustrative local setup: Postgres + Redis for Airflow, webserver and scheduler
-# - You still need a Spark distribution that can accept `spark-submit` inside the Airflow container, or
-#   you can configure the DAG to run spark-submit on a host that has Spark installed and can access mounted data.
+  # --- AUTOMATED STREAM WORKER SERVICE ---
+  stream-worker:
+    <<: *airflow-common
+    command: python3 /opt/airflow/scripts/worker.py stream
+    restart: always
+    depends_on:
+      - airflow-scheduler
